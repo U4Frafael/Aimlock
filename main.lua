@@ -1,13 +1,41 @@
 --[[
-    FOCUS SYSTEM — Versão Otimizada
-    ================================
-    Melhorias principais:
-      • RaycastParams reutilizado e só recriado quando a lista de jogadores muda
-      • UI atualizada em intervalos (0.15s) em vez de cada frame
-      • Sistema de lock com histerese, grace period e cooldown entre trocas
-      • isInvisible usa cache por personagem para evitar GetDescendants em loop
-      • Loops de jogadores só correm quando necessário (alvo inválido)
-      • Separação clara: Targeting / Camera / UI / Input
+    FOCUS SYSTEM — Versão 3D Targeting
+    =====================================
+    Melhorias desta versão sobre a anterior:
+
+    [3D TARGETING]
+      • Score calculado por ÂNGULO ao raio da câmara em vez de distância 2D em píxeis
+        — completamente independente de shift lock ou rotação do personagem
+        — um braço "à frente" da câmara tem sempre score baixo, mesmo que o personagem
+          esteja de lado ou de costas
+      • Sem chamadas a WorldToViewportPoint no targeting — substituído por
+        matemática 3D pura (dot product + acos), mais rápido e mais preciso
+
+    [POSIÇÃO DE MIRA COMPOSTA]
+      • Em vez de mirar num único osso, calcula o centróide ponderado do braço esquerdo
+          LeftHand × 2  +  LeftLowerArm × 1  +  LeftUpperArm × 0.5
+        O ponto de mira fica naturalmente perto da mão (parte mais distal),
+        mas não sofre tanto com animações abruptas do pulso
+      • R6 (Left Arm) é tratado como caso especial — usa a posição direta
+
+    [POSIÇÃO SUAVIZADA]
+      • smoothedAimPos lerpa em direção ao centróide real a cada frame
+        — elimina jitter causado pelas animações do braço
+        — reset automático ao trocar de alvo
+
+    [LINHA DE VISÃO]
+      • hasLineOfSight faz o raycast para o centróide (posição de mira real)
+        em vez do osso primário — consistência entre targeting e câmara
+
+    [CÂMARA]
+      • Usa smoothedAimPos diretamente, sem offset vertical arbitrário
+      • Lerp frame-rate independente mantido
+
+    [PERFORMANCE]
+      • currentCamCF, currentMaxAngle, currentHystAngle calculados
+        uma vez por frame e reutilizados em todas as funções
+      • Restantes otimizações da versão anterior mantidas
+        (RaycastParams reutilizado, cache de invisibilidade, UI em intervalo)
 --]]
 
 --------------------------------------------------
@@ -28,19 +56,20 @@ local camera = Workspace.CurrentCamera
 --// SETTINGS
 --------------------------------------------------
 local CONFIG = {
-    FOV_RADIUS    = 150,      -- Raio do FOV em pixels
-    SMOOTHNESS    = 0.95,     -- Suavidade da câmara (lerp)
-    TOGGLE_KEY    = Enum.KeyCode.Q,
-    UI_KEY        = Enum.KeyCode.J,
-    AIM_KEY       = Enum.UserInputType.MouseButton2,
+    FOV_RADIUS      = 150,    -- Raio do FOV em píxeis (visual + gate de targeting)
+    SMOOTHNESS      = 0.95,   -- Suavidade da câmara (lerp)
+    ARM_SMOOTH      = 0.30,   -- Suavidade da posição de mira (lerp anti-jitter)
+    TOGGLE_KEY      = Enum.KeyCode.Q,
+    UI_KEY          = Enum.KeyCode.J,
+    AIM_KEY         = Enum.UserInputType.MouseButton2,
 
     -- Targeting
-    HYSTERESIS    = 40,       -- Pixels de vantagem dados ao alvo atual vs candidatos
-    GRACE_PERIOD  = 0.25,     -- Segundos antes de largar um alvo que saiu do FOV
+    HYSTERESIS      = 40,     -- Vantagem em píxeis dada ao alvo atual (convertida para ângulo)
+    GRACE_PERIOD    = 0.25,   -- Segundos antes de largar um alvo que saiu do FOV
     SWITCH_COOLDOWN = 0.3,    -- Segundos mínimos entre trocas de alvo
 
     -- UI
-    UI_UPDATE_RATE = 0.15,    -- Intervalo de atualização da UI (segundos)
+    UI_UPDATE_RATE  = 0.15,   -- Intervalo de atualização da UI (segundos)
 }
 
 --------------------------------------------------
@@ -57,13 +86,22 @@ local State = {
 }
 
 -- Targeting
-local lockedTarget    = nil   -- Alvo atual bloqueado
-local graceTimer      = 0     -- Tempo restante de grace period
-local lastSwitchTime  = 0     -- Última vez que o alvo trocou
+local lockedTarget    = nil   -- Part primário do braço (identidade do alvo)
+local graceTimer      = 0
+local lastSwitchTime  = 0
 
--- UI dirty flags — só redesenha quando algo muda
-local uiDirty     = true
-local uiTimer     = 0
+-- Posição de mira suavizada
+local smoothedAimPos  = nil   -- Vector3 lerped, usado pela câmara
+local prevLocked      = nil   -- Detecta troca de alvo para reset do smooth
+
+-- Cache por frame (calculado uma vez em RenderStepped, usado em todas as funções)
+local currentCamCF    = CFrame.new()
+local currentMaxAngle = 0       -- FOV_RADIUS em radianos
+local currentHystAngle = 0      -- HYSTERESIS em radianos
+
+-- UI
+local uiDirty = true
+local uiTimer = 0
 
 --------------------------------------------------
 --// RAYCAST PARAMS (reutilizado, só recriado quando necessário)
@@ -71,7 +109,6 @@ local uiTimer     = 0
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Blacklist
 
--- Reconstrói o filtro do raycast quando jogadores entram/saem
 local function rebuildRayFilter()
     local filtered = {}
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -146,10 +183,10 @@ local function createButton(text)
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
 
     local s = Instance.new("UIStroke")
-    s.Color       = Color3.fromRGB(90, 90, 90)
-    s.Thickness   = 1
+    s.Color        = Color3.fromRGB(90, 90, 90)
+    s.Thickness    = 1
     s.Transparency = 0.25
-    s.Parent      = b
+    s.Parent       = b
 
     b.MouseEnter:Connect(function()
         b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
@@ -212,7 +249,7 @@ UserInputService.InputChanged:Connect(function(input)
     local size    = fovContainer.AbsoluteSize.X
     local percent = math.clamp((x - start) / size, 0, 1)
     CONFIG.FOV_RADIUS = math.floor(1 + (399 * percent))
-    uiDirty = true  -- Slider mudou, força redesenho
+    uiDirty = true
 end)
 
 --------------------------------------------------
@@ -225,7 +262,7 @@ fovCircle.Transparency = 0.6
 fovCircle.Visible      = false
 
 --------------------------------------------------
---// BUTTON EVENTS  (marcam uiDirty para redesenho imediato)
+--// BUTTON EVENTS
 --------------------------------------------------
 toggleBtn.MouseButton1Click:Connect(function()
     State.enabled = not State.enabled
@@ -269,7 +306,9 @@ end)
 UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == CONFIG.AIM_KEY then
         State.holding  = false
-        lockedTarget   = nil   -- Limpa lock ao soltar
+        lockedTarget   = nil
+        smoothedAimPos = nil
+        prevLocked     = nil
         graceTimer     = 0
     end
 end)
@@ -277,23 +316,46 @@ end)
 --------------------------------------------------
 --// TARGETING — Funções auxiliares
 --------------------------------------------------
-
--- Cache de invisibilidade: evita chamar GetDescendants a cada frame
--- É limpo quando o personagem muda
 local invisCache = {}
 
-local function getLeftArm(char)
-    return char:FindFirstChild("LeftHand")
-        or char:FindFirstChild("LeftLowerArm")
-        or char:FindFirstChild("LeftUpperArm")
-        or char:FindFirstChild("Left Arm")
+--[[
+    Retorna (primaryPart, aimPos):
+      primaryPart — Part usado para identificar o alvo (comparações, LOS)
+      aimPos      — Vector3 centróide ponderado do braço, usado para mirar
+
+    Pesos R15:  LeftHand × 2  |  LeftLowerArm × 1  |  LeftUpperArm × 0.5
+    O resultado fica naturalmente próximo da mão sem ser instável ao pulso.
+    R6 usa o único Part disponível (Left Arm) sem centróide.
+--]]
+local function getArmTarget(char)
+    local leg = char:FindFirstChild("Left Arm")  -- R6
+    if leg then
+        return leg, leg.Position
+    end
+
+    local hand  = char:FindFirstChild("LeftHand")
+    local lower = char:FindFirstChild("LeftLowerArm")
+    local upper = char:FindFirstChild("LeftUpperArm")
+
+    local primary = hand or lower or upper
+    if not primary then return nil, nil end
+
+    -- Centróide ponderado
+    local wSum, wTotal = Vector3.zero, 0
+    local partWeights  = { [hand] = 2, [lower] = 1, [upper] = 0.5 }
+    for part, w in pairs(partWeights) do
+        if part then
+            wSum   = wSum + part.Position * w
+            wTotal = wTotal + w
+        end
+    end
+
+    local aimPos = (wTotal > 0) and (wSum / wTotal) or primary.Position
+    return primary, aimPos
 end
 
--- Verifica invisibilidade com cache por personagem
 local function isInvisible(char)
-    if invisCache[char] ~= nil then
-        return invisCache[char]
-    end
+    if invisCache[char] ~= nil then return invisCache[char] end
     for _, part in ipairs(char:GetDescendants()) do
         if part:IsA("BasePart") and part.Transparency < 0.8 then
             invisCache[char] = false
@@ -304,11 +366,10 @@ local function isInvisible(char)
     return true
 end
 
--- Limpa cache quando o personagem é removido
 Players.PlayerAdded:Connect(function(plr)
     plr.CharacterAdded:Connect(function(char)
         invisCache[char] = nil
-        char.DescendantAdded:Connect(function() invisCache[char] = nil end)
+        char.DescendantAdded:Connect(function()   invisCache[char] = nil end)
         char.DescendantRemoving:Connect(function() invisCache[char] = nil end)
     end)
     plr.CharacterRemoving:Connect(function(char)
@@ -330,107 +391,129 @@ local function isValid(plr)
     return true
 end
 
--- Raycast com params reutilizados (sem recriar a cada chamada)
-local function hasLineOfSight(part)
+--[[
+    Raycast para aimPos (centróide) — não para o osso primário.
+    Garante consistência: a linha de visão é verificada exatamente
+    para o ponto que a câmara vai mirar.
+    Todos os personagens estão no filtro, por isso apenas
+    geometria do mapa pode bloquear o raycast.
+--]]
+local function hasLineOfSight(armPart, aimPos)
     if not State.wallCheck then return true end
-    local origin = camera.CFrame.Position
-    local dir    = part.Position - origin
+    local origin = currentCamCF.Position
+    local dir    = aimPos - origin
     local result = Workspace:Raycast(origin, dir, rayParams)
     if result then
-        return result.Instance:IsDescendantOf(part.Parent)
+        return result.Instance:IsDescendantOf(armPart.Parent)
     end
     return true
 end
 
 --------------------------------------------------
---// TARGETING — Sistema de lock com histerese e grace period
+--// TARGETING 3D — Score por ângulo ao raio da câmara
 --------------------------------------------------
-
 --[[
-    Histerese: ao comparar candidatos com o alvo atual,
-    adiciona HYSTERESIS pixels ao score do candidato.
-    Isto significa que um novo alvo só "ganha" se for
-    consideravelmente melhor, evitando trocas desnecessárias.
+    Em vez de medir distância 2D ao centro do ecrã em píxeis,
+    medimos o ÂNGULO entre o vetor câmara→braço e o LookVector da câmara.
 
-    Grace period: quando o alvo atual sai do FOV ou perde
-    linha de visão, não troca imediatamente — espera
-    GRACE_PERIOD segundos. Se o alvo voltar entretanto, mantém.
-]]
+    Vantagens:
+      • Independente da rotação do personagem — funciona sem shift lock
+      • Independente da distância ao alvo — um braço longe e um perto
+        têm o mesmo score se estiverem no mesmo ângulo
+      • Sem WorldToViewportPoint — pura matemática vetorial
 
-local function scoreCandidate(arm)
-    local pos, vis = camera:WorldToViewportPoint(arm.Position)
-    if not vis then return nil end
-    local center = fovCircle.Position
-    local dist   = (Vector2.new(pos.X, pos.Y) - center).Magnitude
-    if dist > CONFIG.FOV_RADIUS then return nil end
-    return dist
+    Fórmula:
+      toArm    = aimPos - camPos
+      forward  = dot(toArm, LookVector)       → componente frontal
+      cosAngle = forward / |toArm|            → cosseno do ângulo
+      angle    = acos(cosAngle)               → ângulo em radianos
+--]]
+local function scoreCandidate(aimPos)
+    local toArm  = aimPos - currentCamCF.Position
+    local forward = toArm:Dot(currentCamCF.LookVector)
+
+    -- Braço atrás da câmara — ignora
+    if forward <= 0 then return nil end
+
+    local cosAngle = forward / toArm.Magnitude
+    local angle    = math.acos(math.clamp(cosAngle, -1, 1))
+
+    -- Fora do FOV (em radianos) — ignora
+    if angle > currentMaxAngle then return nil end
+
+    return angle  -- menor = mais centrado = melhor
 end
 
 local function findBestTarget()
     local best      = nil
+    local bestAim   = nil
     local bestScore = math.huge
     local now       = tick()
 
     for _, plr in ipairs(Players:GetPlayers()) do
         if not isValid(plr) then continue end
         local char = plr.Character
-        local arm  = getLeftArm(char)
-        if not arm then continue end
-        if State.wallCheck and not hasLineOfSight(arm) then continue end
+        local arm, aimPos = getArmTarget(char)
+        if not arm or not aimPos then continue end
+        if State.wallCheck and not hasLineOfSight(arm, aimPos) then continue end
 
-        local score = scoreCandidate(arm)
+        local score = scoreCandidate(aimPos)
         if not score then continue end
 
-        -- Histerese: penaliza candidatos que não são o alvo atual
-        -- para dar estabilidade ao lock existente
-        if arm ~= lockedTarget and now - lastSwitchTime < CONFIG.SWITCH_COOLDOWN then
-            score = score + CONFIG.HYSTERESIS
-        elseif arm ~= lockedTarget then
-            score = score + CONFIG.HYSTERESIS * 0.5
+        -- Histerese em radianos: penaliza candidatos que não são o alvo atual.
+        -- Só troca se o novo alvo for claramente melhor (não apenas ligeiramente).
+        if arm ~= lockedTarget then
+            if now - lastSwitchTime < CONFIG.SWITCH_COOLDOWN then
+                score = score + currentHystAngle          -- penalidade máxima em cooldown
+            else
+                score = score + currentHystAngle * 0.5   -- penalidade reduzida após cooldown
+            end
         end
 
         if score < bestScore then
-            bestScore = best and bestScore or score
-            best      = arm
             bestScore = score
+            best      = arm
+            bestAim   = aimPos
         end
     end
 
-    return best
+    return best, bestAim
 end
 
--- Atualiza o sistema de alvo com grace period
--- Chamado apenas quando holding == true
 local function updateTarget(dt)
     local now = tick()
 
-    -- Verifica se o alvo atual ainda é usável
+    -- Verifica se o alvo atual ainda é válido
     local currentValid = false
     if lockedTarget and lockedTarget.Parent then
         local char = lockedTarget.Parent
         local plr  = Players:GetPlayerFromCharacter(char)
         if plr and isValid(plr) then
-            local score = scoreCandidate(lockedTarget)
-            local los   = not State.wallCheck or hasLineOfSight(lockedTarget)
-            if score and los then
-                currentValid = true
-                graceTimer   = 0
+            local _, aimPos = getArmTarget(char)
+            if aimPos then
+                local score = scoreCandidate(aimPos)
+                local los   = hasLineOfSight(lockedTarget, aimPos)
+                if score and los then
+                    currentValid = true
+                    graceTimer   = 0
+                end
             end
         end
     end
 
     if not currentValid then
         if lockedTarget then
-            -- Grace period: dá uma janela antes de largar o alvo
+            -- Grace period: aguarda antes de largar o alvo
             graceTimer = graceTimer + dt
             if graceTimer < CONFIG.GRACE_PERIOD then
-                return -- Mantém o alvo atual durante o grace period
+                return  -- Mantém lock durante o grace period
             end
         end
         -- Grace expirou ou não havia alvo — procura novo
-        local best = findBestTarget()
+        local best, _ = findBestTarget()
         if best ~= lockedTarget then
             lastSwitchTime = now
+            smoothedAimPos = nil  -- Reset do smooth ao trocar de alvo
         end
         lockedTarget = best
         graceTimer   = 0
@@ -438,13 +521,13 @@ local function updateTarget(dt)
 end
 
 --------------------------------------------------
---// UI — Atualização em intervalo (não a cada frame)
+--// UI — Atualização em intervalo
 --------------------------------------------------
 local function updateUI()
-    toggleBtn.Text = State.enabled        and "Focus: ON"          or "Focus: OFF"
-    teamBtn.Text   = State.teamCheck      and "Team Check: ON"     or "Team Check: OFF"
-    wallBtn.Text   = State.wallCheck      and "Wall Check: ON"     or "Wall Check: OFF"
-    fovBtn.Text    = State.showFOV        and "FOV: ON"            or "FOV: OFF"
+    toggleBtn.Text = State.enabled        and "Focus: ON"           or "Focus: OFF"
+    teamBtn.Text   = State.teamCheck      and "Team Check: ON"      or "Team Check: OFF"
+    wallBtn.Text   = State.wallCheck      and "Wall Check: ON"      or "Wall Check: OFF"
+    fovBtn.Text    = State.showFOV        and "FOV: ON"             or "FOV: OFF"
     invisBtn.Text  = State.invisibleCheck and "Invisible Check: ON" or "Invisible Check: OFF"
     fill.Size      = UDim2.new((CONFIG.FOV_RADIUS - 1) / 399, 0, 1, 0)
     uiDirty = false
@@ -455,37 +538,61 @@ end
 --------------------------------------------------
 RunService.RenderStepped:Connect(function(dt)
 
-    -- ── FOV Circle (visual leve, corre sempre) ──────────────────
+    -- ── Cache por frame ──────────────────────────────────────────
+    -- Calculado uma vez aqui e reutilizado por scoreCandidate,
+    -- findBestTarget, hasLineOfSight — sem repetir operações de câmara
+    currentCamCF = camera.CFrame
+    local halfVFOV       = math.rad(camera.FieldOfView / 2)
+    local pixelsPerRad   = camera.ViewportSize.Y / (2 * math.tan(halfVFOV))
+    currentMaxAngle      = CONFIG.FOV_RADIUS  / pixelsPerRad
+    currentHystAngle     = CONFIG.HYSTERESIS  / pixelsPerRad
+
+    -- ── FOV Circle ───────────────────────────────────────────────
     local center = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
     fovCircle.Position = center
     fovCircle.Radius   = CONFIG.FOV_RADIUS
     fovCircle.Visible  = State.enabled and State.showFOV
 
-    -- ── UI (só atualiza quando necessário ou no intervalo) ───────
+    -- ── UI ───────────────────────────────────────────────────────
     uiTimer = uiTimer + dt
     if uiDirty or uiTimer >= CONFIG.UI_UPDATE_RATE then
         updateUI()
         uiTimer = 0
     end
 
-    -- ── Targeting + Câmara (só corre quando ativo e a segurar) ───
+    -- ── Targeting + Câmara ───────────────────────────────────────
     if not State.enabled or not State.holding then
-        -- Limpa grace timer quando não está a apontar
         if not State.holding then graceTimer = 0 end
         return
     end
 
     updateTarget(dt)
 
-    if not lockedTarget then return end
+    if not lockedTarget or not lockedTarget.Parent then return end
 
-    -- ── Câmara suave com lerp ────────────────────────────────────
-    local camPos    = camera.CFrame.Position
-    local targetPos = lockedTarget.Position + Vector3.new(0, 0.15, 0)
-    local dir       = (targetPos - camPos).Unit
-    local goal      = CFrame.new(camPos, camPos + dir)
+    -- ── Posição de mira suavizada ────────────────────────────────
+    -- Recomputa o centróide do braço e lerpa em direção a ele.
+    -- Reduz jitter causado pelas animações frame a frame.
+    local _, aimBase = getArmTarget(lockedTarget.Parent)
+    if not aimBase then return end
 
-    -- Lerp frame-rate independente para evitar jitter
+    -- Reset do smooth se o alvo mudou (já feito em updateTarget,
+    -- mas pode ter sido nil — garante sempre um valor inicial válido)
+    if lockedTarget ~= prevLocked or not smoothedAimPos then
+        smoothedAimPos = aimBase
+        prevLocked     = lockedTarget
+    else
+        local posAlpha = 1 - (1 - CONFIG.ARM_SMOOTH) ^ (dt * 60)
+        smoothedAimPos = smoothedAimPos:Lerp(aimBase, posAlpha)
+    end
+
+    -- ── Câmara suave ─────────────────────────────────────────────
+    -- Usa a posição suavizada diretamente — sem offset vertical arbitrário,
+    -- pois o centróide já aponta para a zona correta do braço.
+    local camPos = currentCamCF.Position
+    local dir    = (smoothedAimPos - camPos).Unit
+    local goal   = CFrame.new(camPos, camPos + dir)
+
     local alpha = 1 - (1 - CONFIG.SMOOTHNESS) ^ (dt * 60)
     camera.CFrame = camera.CFrame:Lerp(goal, alpha)
 end)
