@@ -290,16 +290,26 @@ end)
 --------------------------------------------------
 UserInputService.InputBegan:Connect(function(input, gpe)
     if gpe then return end
+
     if input.KeyCode == CONFIG.TOGGLE_KEY then
         State.enabled = not State.enabled
         uiDirty = true
+
+        if not State.enabled then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
     end
+
     if input.KeyCode == CONFIG.UI_KEY then
         State.uiVisible = not State.uiVisible
         frame.Visible   = State.uiVisible
     end
+
     if input.UserInputType == CONFIG.AIM_KEY then
         State.holding = true
+
+        -- 🔒 LOCK NO CENTRO (cursor continua visível)
+        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
     end
 end)
 
@@ -310,6 +320,9 @@ UserInputService.InputEnded:Connect(function(input)
         smoothedAimPos = nil
         prevLocked     = nil
         graceTimer     = 0
+
+        -- 🔓 UNLOCK
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
     end
 end)
 
