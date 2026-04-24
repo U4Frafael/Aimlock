@@ -1,42 +1,41 @@
 --[[
-    FOCUS SYSTEM — Versão Alto Impacto
+    FOCUS SYSTEM — Versão 3D Targeting
     =====================================
+    Melhorias desta versão sobre a anterior:
 
-    [MOTION PREDICTION]
-      • Calcula a velocidade real do braço frame a frame: (pos - lastPos) / dt
-      • Filtra a velocidade com EMA (média móvel exponencial) para eliminar
-        picos causados por animações abruptas — PREDICTION_SMOOTH controla
-        o quão suave é o filtro
-      • Projeta a posição futura: predictedPos = smoothedAimPos + vel × travelTime
-        onde travelTime = distância ao alvo / PROJECTILE_SPEED
-      • A predição é usada APENAS para a câmara — o targeting (score/lock)
-        continua a usar a posição real para não afetar a estabilidade do lock
-      • Reset automático ao trocar de alvo ou soltar o botão
+    [3D TARGETING]
+      • Score calculado por ÂNGULO ao raio da câmara em vez de distância 2D em píxeis
+        — completamente independente de shift lock ou rotação do personagem
+        — um braço "à frente" da câmara tem sempre score baixo, mesmo que o personagem
+          esteja de lado ou de costas
+      • Sem chamadas a WorldToViewportPoint no targeting — substituído por
+        matemática 3D pura (dot product + acos), mais rápido e mais preciso
 
-    [VELOCITY-BASED SMOOTHNESS]
-      • Substitui o alpha fixo por um alpha dinâmico baseado no erro angular
-        entre o LookVector atual e a direção do alvo
-      • Longe do alvo (erro grande) → alpha alto → câmara responde rápido
-      • Perto do alvo (erro pequeno) → alpha baixo → tracking suave e estável
-      • Elimina o comportamento inconsistente de antes: demasiado lento
-        em aquisições grandes e nervoso em micro-correções
-      • SMOOTH_FAR / SMOOTH_CLOSE / SMOOTH_ANGLE_MAX são ajustáveis
+    [POSIÇÃO DE MIRA COMPOSTA]
+      • Em vez de mirar num único osso, calcula o centróide ponderado do braço esquerdo
+          LeftHand × 2  +  LeftLowerArm × 1  +  LeftUpperArm × 0.5
+        O ponto de mira fica naturalmente perto da mão (parte mais distal),
+        mas não sofre tanto com animações abruptas do pulso
+      • R6 (Left Arm) é tratado como caso especial — usa a posição direta
 
-    [AIM DRIFT CORRECTION]
-      • Quando o erro angular cai abaixo de SNAP_THRESHOLD (≈0.086°),
-        a câmara faz snap direto para o alvo em vez de continuar a lerpar
-      • Elimina o micro-tremor persistente causado pelo lerp assintótico
-        (o lerp nunca chega a 100% — oscila infinitamente perto do alvo)
-      • Reutiliza o angularError já calculado para velocity-based smoothness
-        sem custo adicional
+    [POSIÇÃO SUAVIZADA]
+      • smoothedAimPos lerpa em direção ao centróide real a cada frame
+        — elimina jitter causado pelas animações do braço
+        — reset automático ao trocar de alvo
 
-    [VERSÕES ANTERIORES — mantidas]
-      • 3D targeting por ângulo (independente de shift lock)
-      • Centróide ponderado do braço esquerdo
-      • Posição suavizada anti-jitter (ARM_SMOOTH)
-      • Histerese, grace period, switch cooldown
-      • RaycastParams reutilizado, cache de invisibilidade
-      • UI em intervalo (UI_UPDATE_RATE)
+    [LINHA DE VISÃO]
+      • hasLineOfSight faz o raycast para o centróide (posição de mira real)
+        em vez do osso primário — consistência entre targeting e câmara
+
+    [CÂMARA]
+      • Usa smoothedAimPos diretamente, sem offset vertical arbitrário
+      • Lerp frame-rate independente mantido
+
+    [PERFORMANCE]
+      • currentCamCF, currentMaxAngle, currentHystAngle calculados
+        uma vez por frame e reutilizados em todas as funções
+      • Restantes otimizações da versão anterior mantidas
+        (RaycastParams reutilizado, cache de invisibilidade, UI em intervalo)
 --]]
 
 --------------------------------------------------
@@ -57,43 +56,20 @@ local camera = Workspace.CurrentCamera
 --// SETTINGS
 --------------------------------------------------
 local CONFIG = {
-    FOV_RADIUS        = 150,    -- Raio do FOV em píxeis (visual + gate de targeting)
-    ARM_SMOOTH        = 0.30,   -- Suavidade da posição de mira (lerp anti-jitter)
-    TOGGLE_KEY        = Enum.KeyCode.Q,
-    UI_KEY            = Enum.KeyCode.J,
-    AIM_KEY           = Enum.UserInputType.MouseButton2,
+    FOV_RADIUS      = 150,    -- Raio do FOV em píxeis (visual + gate de targeting)
+    SMOOTHNESS      = 0.95,   -- Suavidade da câmara (lerp)
+    ARM_SMOOTH      = 0.30,   -- Suavidade da posição de mira (lerp anti-jitter)
+    TOGGLE_KEY      = Enum.KeyCode.Q,
+    UI_KEY          = Enum.KeyCode.J,
+    AIM_KEY         = Enum.UserInputType.MouseButton2,
 
     -- Targeting
-    HYSTERESIS        = 40,     -- Vantagem em píxeis dada ao alvo atual (convertida para ângulo)
-    GRACE_PERIOD      = 0.25,   -- Segundos antes de largar um alvo que saiu do FOV
-    SWITCH_COOLDOWN   = 0.3,    -- Segundos mínimos entre trocas de alvo
-
-    -- Motion Prediction
-    --   PROJECTILE_SPEED: velocidade do projétil do jogo em studs/segundo.
-    --   Ajusta este valor por jogo — é o único parâmetro dependente do jogo.
-    --   Exemplos: 300 (típico), 500 (rifle rápido), 150 (lançador lento)
-    PROJECTILE_SPEED  = 300,
-    --   PREDICTION_SMOOTH: suavidade do filtro EMA da velocidade.
-    --   0.0 = velocidade raw (reagente mas ruidosa)
-    --   0.2 = recomendado — filtra picos de animação sem perder resposta
-    --   0.5 = muito suave (lag em alvos com mudanças bruscas de direção)
-    PREDICTION_SMOOTH = 0.12,
-
-    -- Velocity-Based Smoothness
-    --   SMOOTH_FAR: alpha quando o erro angular é grande (aquisição rápida)
-    --   SMOOTH_CLOSE: alpha quando o erro angular é pequeno (tracking suave)
-    --   A câmara transiciona continuamente entre os dois conforme se aproxima
-    SMOOTH_FAR        = 0.97,   -- usado quando longe do alvo
-    SMOOTH_CLOSE      = 0.85,   -- usado quando perto do alvo
-    SMOOTH_ANGLE_MAX  = 0.08,   -- rad (≈4.6°) — erro acima disto usa SMOOTH_FAR
-
-    -- Aim Drift Correction
-    --   Abaixo deste ângulo (rad), a câmara faz snap direto.
-    --   0.0015 rad ≈ 0.086° — imperceptível ao olho, elimina o micro-tremor
-    SNAP_THRESHOLD    = 0.0015,
+    HYSTERESIS      = 40,     -- Vantagem em píxeis dada ao alvo atual (convertida para ângulo)
+    GRACE_PERIOD    = 0.25,   -- Segundos antes de largar um alvo que saiu do FOV
+    SWITCH_COOLDOWN = 0.3,    -- Segundos mínimos entre trocas de alvo
 
     -- UI
-    UI_UPDATE_RATE    = 0.15,   -- Intervalo de atualização da UI (segundos)
+    UI_UPDATE_RATE  = 0.15,   -- Intervalo de atualização da UI (segundos)
 }
 
 --------------------------------------------------
@@ -110,29 +86,25 @@ local State = {
 }
 
 -- Targeting
-local lockedTarget   = nil
-local graceTimer     = 0
-local lastSwitchTime = 0
+local lockedTarget    = nil   -- Part primário do braço (identidade do alvo)
+local graceTimer      = 0
+local lastSwitchTime  = 0
 
 -- Posição de mira suavizada
-local smoothedAimPos = nil
-local prevLocked     = nil
+local smoothedAimPos  = nil   -- Vector3 lerped, usado pela câmara
+local prevLocked      = nil   -- Detecta troca de alvo para reset do smooth
 
--- Motion Prediction
-local lastAimPos       = nil          -- posição anterior do braço (base de velocidade)
-local smoothedVelocity = Vector3.zero -- velocidade filtrada com EMA
-
--- Cache por frame
-local currentCamCF     = CFrame.new()
-local currentMaxAngle  = 0
-local currentHystAngle = 0
+-- Cache por frame (calculado uma vez em RenderStepped, usado em todas as funções)
+local currentCamCF    = CFrame.new()
+local currentMaxAngle = 0       -- FOV_RADIUS em radianos
+local currentHystAngle = 0      -- HYSTERESIS em radianos
 
 -- UI
 local uiDirty = true
 local uiTimer = 0
 
 --------------------------------------------------
---// RAYCAST PARAMS
+--// RAYCAST PARAMS (reutilizado, só recriado quando necessário)
 --------------------------------------------------
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Blacklist
@@ -154,17 +126,6 @@ Players.PlayerAdded:Connect(function(plr)
     plr.CharacterAdded:Connect(rebuildRayFilter)
     plr.CharacterRemoving:Connect(rebuildRayFilter)
 end)
-
---------------------------------------------------
---// RESET — limpa todo o estado de mira
--- Chamado ao soltar o botão e ao trocar de alvo
---------------------------------------------------
-local function resetAimState()
-    smoothedAimPos   = nil
-    prevLocked       = nil
-    lastAimPos       = nil
-    smoothedVelocity = Vector3.zero
-end
 
 --------------------------------------------------
 --// GUI
@@ -344,10 +305,11 @@ end)
 
 UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == CONFIG.AIM_KEY then
-        State.holding = false
-        lockedTarget  = nil
-        graceTimer    = 0
-        resetAimState()
+        State.holding  = false
+        lockedTarget   = nil
+        smoothedAimPos = nil
+        prevLocked     = nil
+        graceTimer     = 0
     end
 end)
 
@@ -358,16 +320,17 @@ local invisCache = {}
 
 --[[
     Retorna (primaryPart, aimPos):
-      primaryPart — Part usado para lock e LOS
-      aimPos      — Vector3 centróide ponderado do braço (câmara + predição)
+      primaryPart — Part usado para identificar o alvo (comparações, LOS)
+      aimPos      — Vector3 centróide ponderado do braço, usado para mirar
 
     Pesos R15:  LeftHand × 2  |  LeftLowerArm × 1  |  LeftUpperArm × 0.5
-    R6 usa Left Arm diretamente sem centróide.
+    O resultado fica naturalmente próximo da mão sem ser instável ao pulso.
+    R6 usa o único Part disponível (Left Arm) sem centróide.
 --]]
 local function getArmTarget(char)
-    local r6Arm = char:FindFirstChild("Left Arm")
-    if r6Arm then
-        return r6Arm, r6Arm.Position
+    local leg = char:FindFirstChild("Left Arm")  -- R6
+    if leg then
+        return leg, leg.Position
     end
 
     local hand  = char:FindFirstChild("LeftHand")
@@ -377,11 +340,12 @@ local function getArmTarget(char)
     local primary = hand or lower or upper
     if not primary then return nil, nil end
 
+    -- Centróide ponderado
     local wSum, wTotal = Vector3.zero, 0
-    local weights = { [hand] = 2, [lower] = 1, [upper] = 0.5 }
-    for part, w in pairs(weights) do
+    local partWeights  = { [hand] = 2, [lower] = 1, [upper] = 0.5 }
+    for part, w in pairs(partWeights) do
         if part then
-            wSum   = wSum   + part.Position * w
+            wSum   = wSum + part.Position * w
             wTotal = wTotal + w
         end
     end
@@ -405,7 +369,7 @@ end
 Players.PlayerAdded:Connect(function(plr)
     plr.CharacterAdded:Connect(function(char)
         invisCache[char] = nil
-        char.DescendantAdded:Connect(function()    invisCache[char] = nil end)
+        char.DescendantAdded:Connect(function()   invisCache[char] = nil end)
         char.DescendantRemoving:Connect(function() invisCache[char] = nil end)
     end)
     plr.CharacterRemoving:Connect(function(char)
@@ -427,6 +391,13 @@ local function isValid(plr)
     return true
 end
 
+--[[
+    Raycast para aimPos (centróide) — não para o osso primário.
+    Garante consistência: a linha de visão é verificada exatamente
+    para o ponto que a câmara vai mirar.
+    Todos os personagens estão no filtro, por isso apenas
+    geometria do mapa pode bloquear o raycast.
+--]]
 local function hasLineOfSight(armPart, aimPos)
     if not State.wallCheck then return true end
     local origin = currentCamCF.Position
@@ -441,22 +412,41 @@ end
 --------------------------------------------------
 --// TARGETING 3D — Score por ângulo ao raio da câmara
 --------------------------------------------------
+--[[
+    Em vez de medir distância 2D ao centro do ecrã em píxeis,
+    medimos o ÂNGULO entre o vetor câmara→braço e o LookVector da câmara.
+
+    Vantagens:
+      • Independente da rotação do personagem — funciona sem shift lock
+      • Independente da distância ao alvo — um braço longe e um perto
+        têm o mesmo score se estiverem no mesmo ângulo
+      • Sem WorldToViewportPoint — pura matemática vetorial
+
+    Fórmula:
+      toArm    = aimPos - camPos
+      forward  = dot(toArm, LookVector)       → componente frontal
+      cosAngle = forward / |toArm|            → cosseno do ângulo
+      angle    = acos(cosAngle)               → ângulo em radianos
+--]]
 local function scoreCandidate(aimPos)
-    local toArm   = aimPos - currentCamCF.Position
+    local toArm  = aimPos - currentCamCF.Position
     local forward = toArm:Dot(currentCamCF.LookVector)
 
+    -- Braço atrás da câmara — ignora
     if forward <= 0 then return nil end
 
     local cosAngle = forward / toArm.Magnitude
     local angle    = math.acos(math.clamp(cosAngle, -1, 1))
 
+    -- Fora do FOV (em radianos) — ignora
     if angle > currentMaxAngle then return nil end
 
-    return angle
+    return angle  -- menor = mais centrado = melhor
 end
 
 local function findBestTarget()
     local best      = nil
+    local bestAim   = nil
     local bestScore = math.huge
     local now       = tick()
 
@@ -470,26 +460,30 @@ local function findBestTarget()
         local score = scoreCandidate(aimPos)
         if not score then continue end
 
+        -- Histerese em radianos: penaliza candidatos que não são o alvo atual.
+        -- Só troca se o novo alvo for claramente melhor (não apenas ligeiramente).
         if arm ~= lockedTarget then
             if now - lastSwitchTime < CONFIG.SWITCH_COOLDOWN then
-                score = score + currentHystAngle
+                score = score + currentHystAngle          -- penalidade máxima em cooldown
             else
-                score = score + currentHystAngle * 0.5
+                score = score + currentHystAngle * 0.5   -- penalidade reduzida após cooldown
             end
         end
 
         if score < bestScore then
             bestScore = score
             best      = arm
+            bestAim   = aimPos
         end
     end
 
-    return best
+    return best, bestAim
 end
 
 local function updateTarget(dt)
     local now = tick()
 
+    -- Verifica se o alvo atual ainda é válido
     local currentValid = false
     if lockedTarget and lockedTarget.Parent then
         local char = lockedTarget.Parent
@@ -509,15 +503,17 @@ local function updateTarget(dt)
 
     if not currentValid then
         if lockedTarget then
+            -- Grace period: aguarda antes de largar o alvo
             graceTimer = graceTimer + dt
             if graceTimer < CONFIG.GRACE_PERIOD then
-                return
+                return  -- Mantém lock durante o grace period
             end
         end
-        local best = findBestTarget()
+        -- Grace expirou ou não havia alvo — procura novo
+        local best, _ = findBestTarget()
         if best ~= lockedTarget then
             lastSwitchTime = now
-            resetAimState()  -- Limpa predição ao trocar de alvo
+            smoothedAimPos = nil  -- Reset do smooth ao trocar de alvo
         end
         lockedTarget = best
         graceTimer   = 0
@@ -525,7 +521,7 @@ local function updateTarget(dt)
 end
 
 --------------------------------------------------
---// UI
+--// UI — Atualização em intervalo
 --------------------------------------------------
 local function updateUI()
     toggleBtn.Text = State.enabled        and "Focus: ON"           or "Focus: OFF"
@@ -534,7 +530,7 @@ local function updateUI()
     fovBtn.Text    = State.showFOV        and "FOV: ON"             or "FOV: OFF"
     invisBtn.Text  = State.invisibleCheck and "Invisible Check: ON" or "Invisible Check: OFF"
     fill.Size      = UDim2.new((CONFIG.FOV_RADIUS - 1) / 399, 0, 1, 0)
-    uiDirty        = false
+    uiDirty = false
 end
 
 --------------------------------------------------
@@ -543,11 +539,13 @@ end
 RunService.RenderStepped:Connect(function(dt)
 
     -- ── Cache por frame ──────────────────────────────────────────
+    -- Calculado uma vez aqui e reutilizado por scoreCandidate,
+    -- findBestTarget, hasLineOfSight — sem repetir operações de câmara
     currentCamCF = camera.CFrame
-    local halfVFOV     = math.rad(camera.FieldOfView / 2)
-    local pixelsPerRad = camera.ViewportSize.Y / (2 * math.tan(halfVFOV))
-    currentMaxAngle    = CONFIG.FOV_RADIUS / pixelsPerRad
-    currentHystAngle   = CONFIG.HYSTERESIS / pixelsPerRad
+    local halfVFOV       = math.rad(camera.FieldOfView / 2)
+    local pixelsPerRad   = camera.ViewportSize.Y / (2 * math.tan(halfVFOV))
+    currentMaxAngle      = CONFIG.FOV_RADIUS  / pixelsPerRad
+    currentHystAngle     = CONFIG.HYSTERESIS  / pixelsPerRad
 
     -- ── FOV Circle ───────────────────────────────────────────────
     local center = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
@@ -572,82 +570,29 @@ RunService.RenderStepped:Connect(function(dt)
 
     if not lockedTarget or not lockedTarget.Parent then return end
 
-    -- ── Centróide do braço ───────────────────────────────────────
+    -- ── Posição de mira suavizada ────────────────────────────────
+    -- Recomputa o centróide do braço e lerpa em direção a ele.
+    -- Reduz jitter causado pelas animações frame a frame.
     local _, aimBase = getArmTarget(lockedTarget.Parent)
     if not aimBase then return end
 
-    -- ── Posição suavizada (anti-jitter de animações) ─────────────
+    -- Reset do smooth se o alvo mudou (já feito em updateTarget,
+    -- mas pode ter sido nil — garante sempre um valor inicial válido)
     if lockedTarget ~= prevLocked or not smoothedAimPos then
-        -- Primeiro frame do lock ou troca de alvo: inicializa sem lerp
-        smoothedAimPos   = aimBase
-        lastAimPos       = aimBase
-        smoothedVelocity = Vector3.zero
-        prevLocked       = lockedTarget
+        smoothedAimPos = aimBase
+        prevLocked     = lockedTarget
     else
         local posAlpha = 1 - (1 - CONFIG.ARM_SMOOTH) ^ (dt * 60)
         smoothedAimPos = smoothedAimPos:Lerp(aimBase, posAlpha)
     end
 
-    -- ── [1] MOTION PREDICTION ────────────────────────────────────
-    --[[
-        Calcula a velocidade do braço a partir da diferença entre a posição
-        atual e a anterior, dividida pelo tempo. Usa EMA para suavizar picos
-        causados por animações — PREDICTION_SMOOTH controla a suavidade.
+    -- ── Câmara suave ─────────────────────────────────────────────
+    -- Usa a posição suavizada diretamente — sem offset vertical arbitrário,
+    -- pois o centróide já aponta para a zona correta do braço.
+    local camPos = currentCamCF.Position
+    local dir    = (smoothedAimPos - camPos).Unit
+    local goal   = CFrame.new(camPos, camPos + dir)
 
-        travelTime = distância da câmara ao alvo / velocidade do projétil
-        predictedPos = posição suavizada + velocidade filtrada × travelTime
-
-        Nota: usamos smoothedAimPos (não aimBase) como base da predição
-        para que o filtro de jitter já esteja aplicado antes de prever.
-    --]]
-    local rawVel = (aimBase - lastAimPos) / math.max(dt, 0.001)
-    local velAlpha = 1 - (1 - CONFIG.PREDICTION_SMOOTH) ^ (dt * 60)
-    smoothedVelocity = smoothedVelocity:Lerp(rawVel, velAlpha)
-    lastAimPos = aimBase
-
-    local camPos     = currentCamCF.Position
-    local dist3D     = (smoothedAimPos - camPos).Magnitude
-    local travelTime = dist3D / CONFIG.PROJECTILE_SPEED
-    local predictedPos = smoothedAimPos + smoothedVelocity * travelTime
-
-    -- ── Goal da câmara ───────────────────────────────────────────
-    local goalDir = (predictedPos - camPos).Unit
-
-    -- ── Erro angular (partilhado entre [2] e [3]) ────────────────
-    --[[
-        Ângulo entre o LookVector atual da câmara e a direção do alvo.
-        Calculado uma vez e reutilizado pelas duas mecânicas seguintes.
-    --]]
-    local angularError = math.acos(
-        math.clamp(currentCamCF.LookVector:Dot(goalDir), -1, 1)
-    )
-
-    -- ── [3] AIM DRIFT CORRECTION ─────────────────────────────────
-    --[[
-        Se o erro angular for menor que SNAP_THRESHOLD (≈0.086°),
-        a câmara snapa diretamente para o alvo sem lerp.
-        Elimina o micro-tremor causado pelo lerp assintótico quando
-        o alvo está quase perfeitamente centrado.
-    --]]
-    if angularError < CONFIG.SNAP_THRESHOLD then
-        camera.CFrame = CFrame.new(camPos, camPos + goalDir)
-        return
-    end
-
-    -- ── [2] VELOCITY-BASED SMOOTHNESS ────────────────────────────
-    --[[
-        Alpha dinâmico: transiciona entre SMOOTH_CLOSE (perto) e
-        SMOOTH_FAR (longe) com base no erro angular.
-
-        t = 0 → erro pequeno → usa SMOOTH_CLOSE → tracking suave
-        t = 1 → erro grande → usa SMOOTH_FAR  → aquisição rápida
-
-        A câmara deixa de ter o comportamento inconsistente de antes
-        (demasiado lento em trocas, nervosa em micro-correções).
-    --]]
-    local t = math.clamp(angularError / CONFIG.SMOOTH_ANGLE_MAX, 0, 1)
-    local dynSmooth = CONFIG.SMOOTH_CLOSE + (CONFIG.SMOOTH_FAR - CONFIG.SMOOTH_CLOSE) * t
-    local alpha     = 1 - (1 - dynSmooth) ^ (dt * 60)
-
-    camera.CFrame = camera.CFrame:Lerp(CFrame.new(camPos, camPos + goalDir), alpha)
+    local alpha = 1 - (1 - CONFIG.SMOOTHNESS) ^ (dt * 60)
+    camera.CFrame = camera.CFrame:Lerp(goal, alpha)
 end)
