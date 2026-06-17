@@ -1,550 +1,472 @@
---[[
-    FOCUS SYSTEM
-    =====================================
+-- init
+if not game:IsLoaded() then 
+    game.Loaded:Wait()
+end
 
-    [3D TARGETING]
-      • Score calculado por ÂNGULO ao raio da câmara em vez de distância 2D em píxeis
-        — completamente independente de shift lock ou rotação do personagem
-      • Sem WorldToViewportPoint — pura matemática vetorial (dot product + acos)
+if not syn or not protectgui then
+    getgenv().protectgui = function() end
+end
 
-    [POSIÇÃO DE MIRA COMPOSTA]
-      • Centróide ponderado do braço esquerdo:
-          LeftHand × 2  |  LeftLowerArm × 1  |  LeftUpperArm × 0.5
-      • R6 (Left Arm) tratado como caso especial
+local SilentAimSettings = {
+    Enabled = false,
+    
+    ClassName = "Universal Silent Aim - Averiias, Stefanuk12, xaxa",
+    ToggleKey = "RightAlt",
+    
+    TeamCheck = false,
+    VisibleCheck = false, 
+    TargetPart = "Torso",
+    SilentAimMethod = "Raycast",
+    
+    FOVRadius = 130,
+    FOVVisible = false,
+    ShowSilentAimTarget = false, 
+    
+    MouseHitPrediction = false,
+    MouseHitPredictionAmount = 0.165,
+    HitChance = 100
+}
 
-    [CÂMARA COLADA — SNAP DIRETO]
-      • Sem qualquer lerp ou suavização na câmara ou na posição de mira
-      • A cada frame: camera.CFrame = CFrame.new(camPos, braço)
-      • A mira nunca sai do braço independentemente de velocidade ou movimento
-      • Não há "perseguição" — é posicionamento direto e instantâneo
+-- variables
+getgenv().SilentAimSettings = Settings
+local MainFileName = "UniversalSilentAim"
+local SelectedFile, FileToSave = "", ""
 
-    [MOUSE LOCK]
-      • Ao ativar o aim (MouseButton2), o cursor fica preso ao centro
-      • Ao soltar, o cursor é libertado
-      • Ao desativar o sistema (Q), o cursor também é libertado
-
-    [SISTEMA DE LOCK]
-      • Histerese, grace period e switch cooldown mantidos
-      • RaycastParams reutilizado, cache de invisibilidade, UI em intervalo
---]]
-
---------------------------------------------------
---// SERVICES
---------------------------------------------------
-local Players          = game:GetService("Players")
+local Camera = workspace.CurrentCamera
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
 local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local Workspace        = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
 
---------------------------------------------------
---// PLAYER / CAMERA
---------------------------------------------------
-local player = Players.LocalPlayer
-local camera = Workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
 
---------------------------------------------------
---// SETTINGS
---------------------------------------------------
-local CONFIG = {
-    FOV_RADIUS      = 150,    -- Raio do FOV em píxeis (visual + gate de targeting)
-    TOGGLE_KEY      = Enum.KeyCode.Q,
-    UI_KEY          = Enum.KeyCode.J,
-    AIM_KEY         = Enum.UserInputType.MouseButton2,
+local GetChildren = game.GetChildren
+local GetPlayers = Players.GetPlayers
+local WorldToScreen = Camera.WorldToScreenPoint
+local WorldToViewportPoint = Camera.WorldToViewportPoint
+local GetPartsObscuringTarget = Camera.GetPartsObscuringTarget
+local FindFirstChild = game.FindFirstChild
+local RenderStepped = RunService.RenderStepped
+local GuiInset = GuiService.GetGuiInset
+local GetMouseLocation = UserInputService.GetMouseLocation
 
-    -- Targeting
-    HYSTERESIS      = 40,     -- Vantagem em píxeis dada ao alvo atual (convertida para ângulo)
-    GRACE_PERIOD    = 0.25,   -- Segundos antes de largar um alvo que saiu do FOV
-    SWITCH_COOLDOWN = 0.3,    -- Segundos mínimos entre trocas de alvo
+local resume = coroutine.resume 
+local create = coroutine.create
 
-    -- UI
-    UI_UPDATE_RATE  = 0.15,   -- Intervalo de atualização da UI (segundos)
+local ValidTargetParts = {"Torso", "Left Arm"}
+local PredictionAmount = 0.165
+
+local mouse_box = Drawing.new("Square")
+mouse_box.Visible = true 
+mouse_box.ZIndex = 999 
+mouse_box.Color = Color3.fromRGB(54, 57, 241)
+mouse_box.Thickness = 20 
+mouse_box.Size = Vector2.new(20, 20)
+mouse_box.Filled = true 
+
+local fov_circle = Drawing.new("Circle")
+fov_circle.Thickness = 1
+fov_circle.NumSides = 100
+fov_circle.Radius = 180
+fov_circle.Filled = false
+fov_circle.Visible = false
+fov_circle.ZIndex = 999
+fov_circle.Transparency = 1
+fov_circle.Color = Color3.fromRGB(54, 57, 241)
+
+local ExpectedArguments = {
+    FindPartOnRayWithIgnoreList = {
+        ArgCountRequired = 3,
+        Args = {
+            "Instance", "Ray", "table", "boolean", "boolean"
+        }
+    },
+    FindPartOnRayWithWhitelist = {
+        ArgCountRequired = 3,
+        Args = {
+            "Instance", "Ray", "table", "boolean"
+        }
+    },
+    FindPartOnRay = {
+        ArgCountRequired = 2,
+        Args = {
+            "Instance", "Ray", "Instance", "boolean", "boolean"
+        }
+    },
+    Raycast = {
+        ArgCountRequired = 3,
+        Args = {
+            "Instance", "Vector3", "Vector3", "RaycastParams"
+        }
+    }
 }
 
---------------------------------------------------
---// STATES
---------------------------------------------------
-local State = {
-    enabled        = false,
-    holding        = false,
-    uiVisible      = true,
-    teamCheck      = true,
-    wallCheck      = true,
-    showFOV        = true,
-    invisibleCheck = true,
-}
+function CalculateChance(Percentage)
+    -- // Floor the percentage
+    Percentage = math.floor(Percentage)
 
--- Targeting
-local lockedTarget   = nil
-local graceTimer     = 0
-local lastSwitchTime = 0
+    -- // Get the chance
+    local chance = math.floor(Random.new().NextNumber(Random.new(), 0, 1) * 100) / 100
 
--- Cache por frame
-local currentCamCF    = CFrame.new()
-local currentMaxAngle = 0
-local currentHystAngle = 0
+    -- // Return
+    return chance <= Percentage / 100
+end
 
--- UI
-local uiDirty = true
-local uiTimer = 0
 
---------------------------------------------------
---// RAYCAST PARAMS (reutilizado, só recriado quando necessário)
---------------------------------------------------
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+--[[file handling]] do 
+    if not isfolder(MainFileName) then 
+        makefolder(MainFileName);
+    end
+    
+    if not isfolder(string.format("%s/%s", MainFileName, tostring(game.PlaceId))) then 
+        makefolder(string.format("%s/%s", MainFileName, tostring(game.PlaceId)))
+    end
+end
 
-local function rebuildRayFilter()
-    local filtered = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr.Character then
-            table.insert(filtered, plr.Character)
+local Files = listfiles(string.format("%s/%s", "UniversalSilentAim", tostring(game.PlaceId)))
+
+-- functions
+local function GetFiles() -- credits to the linoria lib for this function, listfiles returns the files full path and its annoying
+	local out = {}
+	for i = 1, #Files do
+		local file = Files[i]
+		if file:sub(-4) == '.lua' then
+			-- i hate this but it has to be done ...
+
+			local pos = file:find('.lua', 1, true)
+			local start = pos
+
+			local char = file:sub(pos, pos)
+			while char ~= '/' and char ~= '\\' and char ~= '' do
+				pos = pos - 1
+				char = file:sub(pos, pos)
+			end
+
+			if char == '/' or char == '\\' then
+				table.insert(out, file:sub(pos + 1, start - 1))
+			end
+		end
+	end
+	
+	return out
+end
+
+local function UpdateFile(FileName)
+    assert(FileName or FileName == "string", "oopsies");
+    writefile(string.format("%s/%s/%s.lua", MainFileName, tostring(game.PlaceId), FileName), HttpService:JSONEncode(SilentAimSettings))
+end
+
+local function LoadFile(FileName)
+    assert(FileName or FileName == "string", "oopsies");
+    
+    local File = string.format("%s/%s/%s.lua", MainFileName, tostring(game.PlaceId), FileName)
+    local ConfigData = HttpService:JSONDecode(readfile(File))
+    for Index, Value in next, ConfigData do
+        SilentAimSettings[Index] = Value
+    end
+end
+
+local function getPositionOnScreen(Vector)
+    local Vec3, OnScreen = WorldToScreen(Camera, Vector)
+    return Vector2.new(Vec3.X, Vec3.Y), OnScreen
+end
+
+local function ValidateArguments(Args, RayMethod)
+    local Matches = 0
+    if #Args < RayMethod.ArgCountRequired then
+        return false
+    end
+    for Pos, Argument in next, Args do
+        if typeof(Argument) == RayMethod.Args[Pos] then
+            Matches = Matches + 1
         end
     end
-    rayParams.FilterDescendantsInstances = filtered
+    return Matches >= RayMethod.ArgCountRequired
 end
 
-rebuildRayFilter()
-Players.PlayerAdded:Connect(rebuildRayFilter)
-Players.PlayerRemoving:Connect(rebuildRayFilter)
-Players.PlayerAdded:Connect(function(plr)
-    plr.CharacterAdded:Connect(rebuildRayFilter)
-    plr.CharacterRemoving:Connect(rebuildRayFilter)
-end)
-
---------------------------------------------------
---// GUI
---------------------------------------------------
-local gui = Instance.new("ScreenGui")
-gui.Name = "FocusUI"
-gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
-
-local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 290, 0, 320)
-frame.Position = UDim2.new(0, 20, 0, 20)
-frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-frame.BorderSizePixel = 0
-frame.Parent = gui
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
-
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(70, 70, 70)
-stroke.Thickness = 1
-stroke.Parent = frame
-
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 6)
-layout.Parent = frame
-
-local padding = Instance.new("UIPadding")
-padding.PaddingTop   = UDim.new(0, 40)
-padding.PaddingLeft  = UDim.new(0, 10)
-padding.PaddingRight = UDim.new(0, 10)
-padding.Parent = frame
-
-local title = Instance.new("TextLabel")
-title.Size               = UDim2.new(1, 0, 0, 28)
-title.BackgroundTransparency = 1
-title.Text               = "TERROR DO EB"
-title.Font               = Enum.Font.GothamBold
-title.TextSize           = 14
-title.TextColor3         = Color3.fromRGB(255, 255, 255)
-title.Parent             = frame
-
---------------------------------------------------
---// BUTTONS
---------------------------------------------------
-local function createButton(text)
-    local b = Instance.new("TextButton")
-    b.Size             = UDim2.new(1, 0, 0, 34)
-    b.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    b.TextColor3       = Color3.fromRGB(255, 255, 255)
-    b.Text             = text
-    b.Font             = Enum.Font.Gotham
-    b.TextSize         = 12
-    b.BorderSizePixel  = 0
-    b.Parent           = frame
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-
-    local s = Instance.new("UIStroke")
-    s.Color        = Color3.fromRGB(90, 90, 90)
-    s.Thickness    = 1
-    s.Transparency = 0.25
-    s.Parent       = b
-
-    b.MouseEnter:Connect(function()
-        b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-        s.Transparency = 0
-    end)
-    b.MouseLeave:Connect(function()
-        b.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-        s.Transparency = 0.25
-    end)
-    return b
+local function getDirection(Origin, Position)
+    return (Position - Origin).Unit * 1000
 end
 
-local toggleBtn = createButton("Focus: OFF")
-local teamBtn   = createButton("Team Check: ON")
-local wallBtn   = createButton("Wall Check: ON")
-local fovBtn    = createButton("FOV: ON")
-local invisBtn  = createButton("Invisible Check: ON")
+local function getMousePosition()
+    return GetMouseLocation(UserInputService)
+end
 
---------------------------------------------------
---// FOV SLIDER
---------------------------------------------------
-local fovContainer = Instance.new("Frame")
-fovContainer.Size             = UDim2.new(1, 0, 0, 28)
-fovContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-fovContainer.BorderSizePixel  = 0
-fovContainer.Parent           = frame
-Instance.new("UICorner", fovContainer).CornerRadius = UDim.new(0, 6)
+local function IsPlayerVisible(Player)
+    local PlayerCharacter = Player.Character
+    local LocalPlayerCharacter = LocalPlayer.Character
+    
+    if not (PlayerCharacter or LocalPlayerCharacter) then return end 
+    
+    local PlayerRoot = FindFirstChild(PlayerCharacter, Options.TargetPart.Value) or FindFirstChild(PlayerCharacter, "HumanoidRootPart")
+    
+    if not PlayerRoot then return end 
+    
+    local CastPoints, IgnoreList = {PlayerRoot.Position, LocalPlayerCharacter, PlayerCharacter}, {LocalPlayerCharacter, PlayerCharacter}
+    local ObscuringObjects = #GetPartsObscuringTarget(Camera, CastPoints, IgnoreList)
+    
+    return ((ObscuringObjects == 0 and true) or (ObscuringObjects > 0 and false))
+end
 
-local bar = Instance.new("Frame")
-bar.Size             = UDim2.new(1, -10, 0, 6)
-bar.Position         = UDim2.new(0, 5, 0.5, -3)
-bar.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
-bar.BorderSizePixel  = 0
-bar.Parent           = fovContainer
-Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+local function getClosestPlayer()
+    if not Options.TargetPart.Value then return end
+    local Closest
+    local DistanceToMouse
+    for _, Player in next, GetPlayers(Players) do
+        if Player == LocalPlayer then continue end
+        if Toggles.TeamCheck.Value and Player.Team == LocalPlayer.Team then continue end
 
-local fill = Instance.new("Frame")
-fill.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
-fill.BorderSizePixel  = 0
-fill.Parent           = bar
-Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+        local Character = Player.Character
+        if not Character then continue end
+        
+        if Toggles.VisibleCheck.Value and not IsPlayerVisible(Player) then continue end
 
-local dragging = false
+        local HumanoidRootPart = FindFirstChild(Character, "HumanoidRootPart")
+        local Humanoid = FindFirstChild(Character, "Humanoid")
+        if not HumanoidRootPart or not Humanoid or Humanoid and Humanoid.Health <= 0 then continue end
 
-fovContainer.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = true
-    end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = false
-    end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if not dragging then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-    local x       = input.Position.X
-    local start   = fovContainer.AbsolutePosition.X
-    local size    = fovContainer.AbsoluteSize.X
-    local percent = math.clamp((x - start) / size, 0, 1)
-    CONFIG.FOV_RADIUS = math.floor(1 + (399 * percent))
-    uiDirty = true
-end)
+        local ScreenPosition, OnScreen = getPositionOnScreen(HumanoidRootPart.Position)
+        if not OnScreen then continue end
 
---------------------------------------------------
---// FOV VISUAL
---------------------------------------------------
-local fovCircle = Drawing.new("Circle")
-fovCircle.Thickness    = 2
-fovCircle.Color        = Color3.fromRGB(255, 80, 80)
-fovCircle.Transparency = 0.6
-fovCircle.Visible      = false
-
---------------------------------------------------
---// BUTTON EVENTS
---------------------------------------------------
-toggleBtn.MouseButton1Click:Connect(function()
-    State.enabled = not State.enabled
-    uiDirty = true
-end)
-teamBtn.MouseButton1Click:Connect(function()
-    State.teamCheck = not State.teamCheck
-    uiDirty = true
-end)
-wallBtn.MouseButton1Click:Connect(function()
-    State.wallCheck = not State.wallCheck
-    uiDirty = true
-end)
-fovBtn.MouseButton1Click:Connect(function()
-    State.showFOV = not State.showFOV
-    uiDirty = true
-end)
-invisBtn.MouseButton1Click:Connect(function()
-    State.invisibleCheck = not State.invisibleCheck
-    uiDirty = true
-end)
-
---------------------------------------------------
---// INPUT
---------------------------------------------------
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-
-    if input.KeyCode == CONFIG.TOGGLE_KEY then
-        State.enabled = not State.enabled
-        uiDirty = true
-
-        if not State.enabled then
-            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        local Distance = (getMousePosition() - ScreenPosition).Magnitude
+        if Distance <= (DistanceToMouse or Options.Radius.Value or 2000) then
+            Closest = ((Options.TargetPart.Value == "Random" and Character[ValidTargetParts[math.random(1, #ValidTargetParts)]]) or Character[Options.TargetPart.Value])
+            DistanceToMouse = Distance
         end
     end
-
-    if input.KeyCode == CONFIG.UI_KEY then
-        State.uiVisible = not State.uiVisible
-        frame.Visible   = State.uiVisible
-    end
-
-    if input.UserInputType == CONFIG.AIM_KEY then
-        State.holding = true
-
-        -- Cursor preso ao centro enquanto o aim está ativo
-        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == CONFIG.AIM_KEY then
-        State.holding = false
-        lockedTarget  = nil
-        graceTimer    = 0
-
-        -- Liberta o cursor ao soltar
-        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-    end
-end)
-
---------------------------------------------------
---// TARGETING — Funções auxiliares
---------------------------------------------------
-local invisCache = {}
-
---[[
-    Retorna (primaryPart, aimPos):
-      primaryPart — Part usado para lock e LOS
-      aimPos      — Vector3 centróide ponderado do braço
-
-    Pesos R15:  LeftHand × 2  |  LeftLowerArm × 1  |  LeftUpperArm × 0.5
-    R6 usa Left Arm diretamente.
---]]
-local function getArmTarget(char)
-    local r6Arm = char:FindFirstChild("Left Arm")
-    if r6Arm then
-        return r6Arm, r6Arm.Position
-    end
-
-    local hand  = char:FindFirstChild("LeftHand")
-    local lower = char:FindFirstChild("LeftLowerArm")
-    local upper = char:FindFirstChild("LeftUpperArm")
-
-    local primary = hand or lower or upper
-    if not primary then return nil, nil end
-
-    local wSum, wTotal = Vector3.zero, 0
-    local weights = { [hand] = 2, [lower] = 1, [upper] = 0.5 }
-    for part, w in pairs(weights) do
-        if part then
-            wSum   = wSum   + part.Position * w
-            wTotal = wTotal + w
-        end
-    end
-
-    local aimPos = (wTotal > 0) and (wSum / wTotal) or primary.Position
-    return primary, aimPos
+    return Closest
 end
 
-local function isInvisible(char)
-    if invisCache[char] ~= nil then return invisCache[char] end
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") and part.Transparency < 0.8 then
-            invisCache[char] = false
-            return false
-        end
-    end
-    invisCache[char] = true
-    return true
-end
+-- ui creating & handling
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/Library.lua"))()
+Library:SetWatermark("github.com/Averiias")
 
-Players.PlayerAdded:Connect(function(plr)
-    plr.CharacterAdded:Connect(function(char)
-        invisCache[char] = nil
-        char.DescendantAdded:Connect(function()    invisCache[char] = nil end)
-        char.DescendantRemoving:Connect(function() invisCache[char] = nil end)
+local Window = Library:CreateWindow({Title = 'Universal Silent Aim', Center = true, AutoShow = true, TabPadding = 8, MenuFadeTime = 0.2})
+local GeneralTab = Window:AddTab("General")
+local MainBOX = GeneralTab:AddLeftTabbox("Main") do
+    local Main = MainBOX:AddTab("Main")
+    
+    Main:AddToggle("aim_Enabled", {Text = "Enabled"}):AddKeyPicker("aim_Enabled_KeyPicker", {Default = "RightAlt", SyncToggleState = true, Mode = "Toggle", Text = "Enabled", NoUI = false});
+    Options.aim_Enabled_KeyPicker:OnClick(function()
+        SilentAimSettings.Enabled = not SilentAimSettings.Enabled
+        
+        Toggles.aim_Enabled.Value = SilentAimSettings.Enabled
+        Toggles.aim_Enabled:SetValue(SilentAimSettings.Enabled)
+        
+        mouse_box.Visible = SilentAimSettings.Enabled
     end)
-    plr.CharacterRemoving:Connect(function(char)
-        invisCache[char] = nil
+    
+    Main:AddToggle("TeamCheck", {Text = "Team Check", Default = SilentAimSettings.TeamCheck}):OnChanged(function()
+        SilentAimSettings.TeamCheck = Toggles.TeamCheck.Value
     end)
-end)
-
-local function isValid(plr)
-    if plr == player then return false end
-    local char = plr.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
-    if State.invisibleCheck and isInvisible(char) then return false end
-    if not State.teamCheck then return true end
-    if player.Team and plr.Team then
-        return player.Team ~= plr.Team
-    end
-    return true
+    Main:AddToggle("VisibleCheck", {Text = "Visible Check", Default = SilentAimSettings.VisibleCheck}):OnChanged(function()
+        SilentAimSettings.VisibleCheck = Toggles.VisibleCheck.Value
+    end)
+    Main:AddDropdown("TargetPart", {AllowNull = true, Text = "Target Part", Default = SilentAimSettings.TargetPart, Values = {"Torso", "Random", "Left Arm"}}):OnChanged(function()
+        SilentAimSettings.TargetPart = Options.TargetPart.Value
+    end)
+    Main:AddDropdown("Method", {AllowNull = true, Text = "Silent Aim Method", Default = SilentAimSettings.SilentAimMethod, Values = {
+        "Raycast","FindPartOnRay",
+        "FindPartOnRayWithWhitelist",
+        "FindPartOnRayWithIgnoreList",
+        "Mouse.Hit/Target"
+    }}):OnChanged(function() 
+        SilentAimSettings.SilentAimMethod = Options.Method.Value 
+    end)
+    Main:AddSlider('HitChance', {
+        Text = 'Hit chance',
+        Default = 100,
+        Min = 0,
+        Max = 100,
+        Rounding = 1,
+    
+        Compact = false,
+    })
+    Options.HitChance:OnChanged(function()
+        SilentAimSettings.HitChance = Options.HitChance.Value
+    end)
 end
 
-local function hasLineOfSight(armPart, aimPos)
-    if not State.wallCheck then return true end
-    local origin = currentCamCF.Position
-    local dir    = aimPos - origin
-    local result = Workspace:Raycast(origin, dir, rayParams)
-    if result then
-        return result.Instance:IsDescendantOf(armPart.Parent)
-    end
-    return true
+local MiscellaneousBOX = GeneralTab:AddLeftTabbox("Miscellaneous")
+local FieldOfViewBOX = GeneralTab:AddLeftTabbox("Field Of View") do
+    local Main = FieldOfViewBOX:AddTab("Visuals")
+    
+    Main:AddToggle("Visible", {Text = "Show FOV Circle"}):AddColorPicker("Color", {Default = Color3.fromRGB(54, 57, 241)}):OnChanged(function()
+        fov_circle.Visible = Toggles.Visible.Value
+        SilentAimSettings.FOVVisible = Toggles.Visible.Value
+    end)
+    Main:AddSlider("Radius", {Text = "FOV Circle Radius", Min = 0, Max = 360, Default = 130, Rounding = 0}):OnChanged(function()
+        fov_circle.Radius = Options.Radius.Value
+        SilentAimSettings.FOVRadius = Options.Radius.Value
+    end)
+    Main:AddToggle("MousePosition", {Text = "Show Silent Aim Target"}):AddColorPicker("MouseVisualizeColor", {Default = Color3.fromRGB(54, 57, 241)}):OnChanged(function()
+        mouse_box.Visible = Toggles.MousePosition.Value 
+        SilentAimSettings.ShowSilentAimTarget = Toggles.MousePosition.Value 
+    end)
+    local PredictionTab = MiscellaneousBOX:AddTab("Prediction")
+    PredictionTab:AddToggle("Prediction", {Text = "Mouse.Hit/Target Prediction"}):OnChanged(function()
+        SilentAimSettings.MouseHitPrediction = Toggles.Prediction.Value
+    end)
+    PredictionTab:AddSlider("Amount", {Text = "Prediction Amount", Min = 0.165, Max = 1, Default = 0.165, Rounding = 3}):OnChanged(function()
+        PredictionAmount = Options.Amount.Value
+        SilentAimSettings.MouseHitPredictionAmount = Options.Amount.Value
+    end)
 end
 
---------------------------------------------------
---// TARGETING 3D — Score por ângulo ao raio da câmara
---------------------------------------------------
-local function scoreCandidate(aimPos)
-    local toArm   = aimPos - currentCamCF.Position
-    local forward = toArm:Dot(currentCamCF.LookVector)
-
-    if forward <= 0 then return nil end
-
-    local cosAngle = forward / toArm.Magnitude
-    local angle    = math.acos(math.clamp(cosAngle, -1, 1))
-
-    if angle > currentMaxAngle then return nil end
-
-    return angle
+local CreateConfigurationBOX = GeneralTab:AddRightTabbox("Create Configuration") do 
+    local Main = CreateConfigurationBOX:AddTab("Create Configuration")
+    
+    Main:AddInput("CreateConfigTextBox", {Default = "", Numeric = false, Finished = false, Text = "Create Configuration to Create", Tooltip = "Creates a configuration file containing settings you can save and load", Placeholder = "File Name here"}):OnChanged(function()
+        if Options.CreateConfigTextBox.Value and string.len(Options.CreateConfigTextBox.Value) ~= "" then 
+            FileToSave = Options.CreateConfigTextBox.Value
+        end
+    end)
+    
+    Main:AddButton("Create Configuration File", function()
+        if FileToSave ~= "" or FileToSave ~= nil then 
+            UpdateFile(FileToSave)
+        end
+    end)
 end
 
-local function findBestTarget()
-    local best      = nil
-    local bestScore = math.huge
-    local now       = tick()
+local SaveConfigurationBOX = GeneralTab:AddRightTabbox("Save Configuration") do 
+    local Main = SaveConfigurationBOX:AddTab("Save Configuration")
+    Main:AddDropdown("SaveConfigurationDropdown", {AllowNull = true, Values = GetFiles(), Text = "Choose Configuration to Save"})
+    Main:AddButton("Save Configuration", function()
+        if Options.SaveConfigurationDropdown.Value then 
+            UpdateFile(Options.SaveConfigurationDropdown.Value)
+        end
+    end)
+end
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if not isValid(plr) then continue end
-        local char = plr.Character
-        local arm, aimPos = getArmTarget(char)
-        if not arm or not aimPos then continue end
-        if State.wallCheck and not hasLineOfSight(arm, aimPos) then continue end
+local LoadConfigurationBOX = GeneralTab:AddRightTabbox("Load Configuration") do 
+    local Main = LoadConfigurationBOX:AddTab("Load Configuration")
+    
+    Main:AddDropdown("LoadConfigurationDropdown", {AllowNull = true, Values = GetFiles(), Text = "Choose Configuration to Load"})
+    Main:AddButton("Load Configuration", function()
+        if table.find(GetFiles(), Options.LoadConfigurationDropdown.Value) then
+            LoadFile(Options.LoadConfigurationDropdown.Value)
+            
+            Toggles.TeamCheck:SetValue(SilentAimSettings.TeamCheck)
+            Toggles.VisibleCheck:SetValue(SilentAimSettings.VisibleCheck)
+            Options.TargetPart:SetValue(SilentAimSettings.TargetPart)
+            Options.Method:SetValue(SilentAimSettings.SilentAimMethod)
+            Toggles.Visible:SetValue(SilentAimSettings.FOVVisible)
+            Options.Radius:SetValue(SilentAimSettings.FOVRadius)
+            Toggles.MousePosition:SetValue(SilentAimSettings.ShowSilentAimTarget)
+            Toggles.Prediction:SetValue(SilentAimSettings.MouseHitPrediction)
+            Options.Amount:SetValue(SilentAimSettings.MouseHitPredictionAmount)
+            Options.HitChance:SetValue(SilentAimSettings.HitChance)
+        end
+    end)
+end
 
-        local score = scoreCandidate(aimPos)
-        if not score then continue end
-
-        if arm ~= lockedTarget then
-            if now - lastSwitchTime < CONFIG.SWITCH_COOLDOWN then
-                score = score + currentHystAngle
-            else
-                score = score + currentHystAngle * 0.5
+resume(create(function()
+    RenderStepped:Connect(function()
+        if Toggles.MousePosition.Value and Toggles.aim_Enabled.Value then
+            if getClosestPlayer() then 
+                local Root = getClosestPlayer().Parent.PrimaryPart or getClosestPlayer()
+                local RootToViewportPoint, IsOnScreen = WorldToViewportPoint(Camera, Root.Position);
+                -- using PrimaryPart instead because if your Target Part is "Random" it will flicker the square between the Target's Head and HumanoidRootPart (its annoying)
+                
+                mouse_box.Visible = IsOnScreen
+                mouse_box.Position = Vector2.new(RootToViewportPoint.X, RootToViewportPoint.Y)
+            else 
+                mouse_box.Visible = false 
+                mouse_box.Position = Vector2.new()
             end
         end
-
-        if score < bestScore then
-            bestScore = score
-            best      = arm
+        
+        if Toggles.Visible.Value then 
+            fov_circle.Visible = Toggles.Visible.Value
+            fov_circle.Color = Options.Color.Value
+            fov_circle.Position = getMousePosition()
         end
-    end
+    end)
+end))
 
-    return best
-end
+-- hooks
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(...)
+    local Method = getnamecallmethod()
+    local Arguments = {...}
+    local self = Arguments[1]
+    local chance = CalculateChance(SilentAimSettings.HitChance)
+    if Toggles.aim_Enabled.Value and self == workspace and not checkcaller() and chance == true then
+        if Method == "FindPartOnRayWithIgnoreList" and Options.Method.Value == Method then
+            if ValidateArguments(Arguments, ExpectedArguments.FindPartOnRayWithIgnoreList) then
+                local A_Ray = Arguments[2]
 
-local function updateTarget(dt)
-    local now = tick()
+                local HitPart = getClosestPlayer()
+                if HitPart then
+                    local Origin = A_Ray.Origin
+                    local Direction = getDirection(Origin, HitPart.Position)
+                    Arguments[2] = Ray.new(Origin, Direction)
 
-    local currentValid = false
-    if lockedTarget and lockedTarget.Parent then
-        local char = lockedTarget.Parent
-        local plr  = Players:GetPlayerFromCharacter(char)
-        if plr and isValid(plr) then
-            local _, aimPos = getArmTarget(char)
-            if aimPos then
-                -- Alvo bloqueado: verifica apenas se ainda está vivo,
-                -- válido e com linha de visão. O ângulo não é verificado
-                -- aqui porque a câmara já está colada ao braço — o alvo
-                -- está sempre "dentro do FOV" enquanto o lock está ativo.
-                local los = hasLineOfSight(lockedTarget, aimPos)
-                if los then
-                    currentValid = true
-                    graceTimer   = 0
+                    return oldNamecall(unpack(Arguments))
+                end
+            end
+        elseif Method == "FindPartOnRayWithWhitelist" and Options.Method.Value == Method then
+            if ValidateArguments(Arguments, ExpectedArguments.FindPartOnRayWithWhitelist) then
+                local A_Ray = Arguments[2]
+
+                local HitPart = getClosestPlayer()
+                if HitPart then
+                    local Origin = A_Ray.Origin
+                    local Direction = getDirection(Origin, HitPart.Position)
+                    Arguments[2] = Ray.new(Origin, Direction)
+
+                    return oldNamecall(unpack(Arguments))
+                end
+            end
+        elseif (Method == "FindPartOnRay" or Method == "findPartOnRay") and Options.Method.Value:lower() == Method:lower() then
+            if ValidateArguments(Arguments, ExpectedArguments.FindPartOnRay) then
+                local A_Ray = Arguments[2]
+
+                local HitPart = getClosestPlayer()
+                if HitPart then
+                    local Origin = A_Ray.Origin
+                    local Direction = getDirection(Origin, HitPart.Position)
+                    Arguments[2] = Ray.new(Origin, Direction)
+
+                    return oldNamecall(unpack(Arguments))
+                end
+            end
+        elseif Method == "Raycast" and Options.Method.Value == Method then
+            if ValidateArguments(Arguments, ExpectedArguments.Raycast) then
+                local A_Origin = Arguments[2]
+
+                local HitPart = getClosestPlayer()
+                if HitPart then
+                    Arguments[3] = getDirection(A_Origin, HitPart.Position)
+
+                    return oldNamecall(unpack(Arguments))
                 end
             end
         end
     end
+    return oldNamecall(...)
+end))
 
-    if not currentValid then
-        if lockedTarget then
-            graceTimer = graceTimer + dt
-            if graceTimer < CONFIG.GRACE_PERIOD then
-                return
-            end
+local oldIndex = nil 
+oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, Index)
+    if self == Mouse and not checkcaller() and Toggles.aim_Enabled.Value and Options.Method.Value == "Mouse.Hit/Target" and getClosestPlayer() then
+        local HitPart = getClosestPlayer()
+         
+        if Index == "Target" or Index == "target" then 
+            return HitPart
+        elseif Index == "Hit" or Index == "hit" then 
+            return ((Toggles.Prediction.Value and (HitPart.CFrame + (HitPart.Velocity * PredictionAmount))) or (not Toggles.Prediction.Value and HitPart.CFrame))
+        elseif Index == "X" or Index == "x" then 
+            return self.X 
+        elseif Index == "Y" or Index == "y" then 
+            return self.Y 
+        elseif Index == "UnitRay" then 
+            return Ray.new(self.Origin, (self.Hit - self.Origin).Unit)
         end
-        local best = findBestTarget()
-        if best ~= lockedTarget then
-            lastSwitchTime = now
-        end
-        lockedTarget = best
-        graceTimer   = 0
-    end
-end
-
---------------------------------------------------
---// UI
---------------------------------------------------
-local function updateUI()
-    toggleBtn.Text = State.enabled        and "Focus: ON"           or "Focus: OFF"
-    teamBtn.Text   = State.teamCheck      and "Team Check: ON"      or "Team Check: OFF"
-    wallBtn.Text   = State.wallCheck      and "Wall Check: ON"      or "Wall Check: OFF"
-    fovBtn.Text    = State.showFOV        and "FOV: ON"             or "FOV: OFF"
-    invisBtn.Text  = State.invisibleCheck and "Invisible Check: ON" or "Invisible Check: OFF"
-    fill.Size      = UDim2.new((CONFIG.FOV_RADIUS - 1) / 399, 0, 1, 0)
-    uiDirty        = false
-end
-
---------------------------------------------------
---// LOOP PRINCIPAL
---------------------------------------------------
-RunService.RenderStepped:Connect(function(dt)
-
-    -- ── Cache por frame ──────────────────────────────────────────
-    currentCamCF = camera.CFrame
-    local halfVFOV     = math.rad(camera.FieldOfView / 2)
-    local pixelsPerRad = camera.ViewportSize.Y / (2 * math.tan(halfVFOV))
-    currentMaxAngle    = CONFIG.FOV_RADIUS  / pixelsPerRad
-    currentHystAngle   = CONFIG.HYSTERESIS  / pixelsPerRad
-
-    -- ── FOV Circle ───────────────────────────────────────────────
-    local center = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
-    fovCircle.Position = center
-    fovCircle.Radius   = CONFIG.FOV_RADIUS
-    fovCircle.Visible  = State.enabled and State.showFOV
-
-    -- ── UI ───────────────────────────────────────────────────────
-    uiTimer = uiTimer + dt
-    if uiDirty or uiTimer >= CONFIG.UI_UPDATE_RATE then
-        updateUI()
-        uiTimer = 0
     end
 
-    -- ── Targeting + Câmara ───────────────────────────────────────
-    if not State.enabled or not State.holding then
-        if not State.holding then graceTimer = 0 end
-        return
-    end
-
-    updateTarget(dt)
-
-    if not lockedTarget or not lockedTarget.Parent then return end
-
-    -- ── Centróide do braço — posição real e atual, sem lerp ──────
-    local _, aimPos = getArmTarget(lockedTarget.Parent)
-    if not aimPos then return end
-
-    -- ── SNAP DIRETO — câmara colada ao braço ─────────────────────
-    --[[
-        Sem lerp. Sem suavização. A câmara aponta DIRETAMENTE para o
-        centróide do braço neste exato frame.
-
-        Não há "perseguição" — é posicionamento instantâneo.
-        O braço pode mover-se à velocidade que quiser: a câmara
-        está sempre exatamente onde o braço está.
-    --]]
-    local camPos = currentCamCF.Position
-    local goalDir = (aimPos - camPos).Unit
-    camera.CFrame = CFrame.new(camPos, camPos + goalDir)
-end)
+    return oldIndex(self, Index)
+end))
